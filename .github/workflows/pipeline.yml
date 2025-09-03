@@ -12,7 +12,7 @@ permissions:
   security-events: write
 
 env:
-  FAIL_ON_CRITICAL: "true"   # флаг для Gate (оставил, если захочешь мягкий режим)
+  FAIL_ON_CRITICAL: "true"   
 
 jobs:
   # =========================
@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Вычисляем имя образа и короткий тег
+      
       - name: Compute image meta (lowercase)
         id: meta
         shell: bash
@@ -182,7 +182,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ПОДНИМАЕМ НА 8081 (DefectDojo слушает там)
+      # ПОДНИМАЕМ НА 8081 
       - name: Run target container
         id: run_target
         shell: bash
@@ -206,7 +206,7 @@ jobs:
       - name: ZAP Baseline Scan
         uses: zaproxy/action-baseline@v0.9.0
         with:
-          target: "http://localhost:8081"   # <— тоже 8081
+          target: "http://localhost:8081"   
           cmd_options: "-a -J"
           fail_action: false
         continue-on-error: true
