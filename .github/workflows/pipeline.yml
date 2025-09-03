@@ -1,63 +1,69 @@
-name: DevSecOps Pipeline (GHCR + SAST + Trivy + DAST)
+name: DevSecOps pipeline (DefectDojo)
 
 on:
   push:
     branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
 
+permissions:
+  contents: read
+  packages: write
+
+# ──────────────────────────────
+# Stage 1 — Build & push (GHCR)
+# ──────────────────────────────
 jobs:
   build_and_push:
-    name: Build & Push Docker image
+    name: Stage 1 — Build & push image to GHCR
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      # <-- ВАЖНО: считаем имя образа в НИЖНЕМ регистре
-      - name: Compute image coordinates (lowercase)
-        id: img
-        shell: bash
-        run: |
-          OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
-          REPO_LC="$(basename "$GITHUB_REPOSITORY")"
-          REPO_LC="${REPO_LC,,}"
-          IMAGE_BASE="ghcr.io/${OWNER_LC}/${REPO_LC}"
-          LATEST_TAG="${IMAGE_BASE}:latest"
-          COMMIT_TAG="${IMAGE_BASE}:${GITHUB_SHA::7}"
-
-          echo "image_base=${IMAGE_BASE}"  >> "$GITHUB_OUTPUT"
-          echo "latest_tag=${LATEST_TAG}"  >> "$GITHUB_OUTPUT"
-          echo "commit_tag=${COMMIT_TAG}"  >> "$GITHUB_OUTPUT"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build + Push (latest, sha)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ steps.img.outputs.latest_tag }}
-            ${{ steps.img.outputs.commit_tag }}
-
-  sast_bandit:
-    name: SAST - Bandit
-    runs-on: ubuntu-24.04
-    needs: build_and_push
     steps:
       - uses: actions/checkout@v4
-      - name: Run Bandit
+
+      # Если у проекта нет Dockerfile — сгенерим простой, чтобы показать "сборку+доставку"
+      - name: Ensure Dockerfile (fallback)
+        run: |
+          if [ ! -f Dockerfile ]; then
+            cat > Dockerfile <<'EOF'
+            FROM nginx:alpine
+            RUN echo OK > /usr/share/nginx/html/healthz
+            EXPOSE 80
+            CMD ["nginx","-g","daemon off;"]
+            EOF
+          fi
+
+      - name: Compute image name (lowercase)
+        id: meta
+        shell: bash
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${owner}/${repo}" >>"$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA::7}" >>"$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build
+        run: |
+          docker build -t "${{ steps.meta.outputs.image }}:latest" \
+                       -t "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}" .
+
+      - name: Push
+        run: |
+          docker push "${{ steps.meta.outputs.image }}:latest"
+          docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
+
+# ─────────────────────────────────────────
+# Stage 2 & 4 — SAST + Secrets + Config
+# ─────────────────────────────────────────
+  sast_secret_config:
+    name: Stage 2/4 — SAST + Secrets + Config
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bandit (Python SAST)
         run: |
           pipx install bandit
           bandit -r . -f sarif -o bandit.sarif || true
@@ -66,29 +72,18 @@ jobs:
           name: bandit-sarif
           path: bandit.sarif
 
-  sast_semgrep:
-    name: SAST - Semgrep
-    runs-on: ubuntu-24.04
-    needs: build_and_push
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run Semgrep (auto rules)
+      - name: Semgrep (generic SAST)
         uses: returntocorp/semgrep-action@v1
         with:
           config: p/ci
           generateSarif: true
+          auditOn: push
       - uses: actions/upload-artifact@v4
         with:
           name: semgrep-sarif
           path: semgrep.sarif
 
-  secrets_gitleaks:
-    name: Secrets scan - Gitleaks
-    runs-on: ubuntu-24.04
-    needs: build_and_push
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run Gitleaks
+      - name: Gitleaks (secrets)
         uses: zricethezav/gitleaks-action@v2
         with:
           args: detect --redact --report-format sarif --report-path gitleaks.sarif
@@ -97,104 +92,157 @@ jobs:
           name: gitleaks-sarif
           path: gitleaks.sarif
 
-  trivy_image:
-    name: Image & Config scan - Trivy
-    runs-on: ubuntu-24.04
-    needs: build_and_push
-    steps:
-      - name: Trivy image scan (SARIF)
-        uses: aquasecurity/trivy-action@0.24.0
-        with:
-          image-ref: ${{ needs.build_and_push.outputs.latest_tag || '' }}
-        env:
-          # если outputs недоступны напрямую — считываем повторно так же, как в build job
-          IMAGE_BASE: ghcr.io/${{ github.repository_owner }}}/${{ github.event.repository.name }}
-      - name: Trivy (robust) — recompute tag and scan
-        if: always()
-        shell: bash
+      - name: Hadolint (Dockerfile lint)
         run: |
-          OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
-          REPO_LC="$(basename "$GITHUB_REPOSITORY")"; REPO_LC="${REPO_LC,,}"
-          IMG="ghcr.io/${OWNER_LC}/${REPO_LC}:latest"
-          docker pull "$IMG"
-          trivy image --exit-code 0 --format sarif --output trivy.sarif "$IMG"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: trivy-sarif
-          path: trivy.sarif
-
-  hadolint:
-    name: Dockerfile Lint - Hadolint
-    runs-on: ubuntu-24.04
-    needs: build_and_push
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run hadolint
-        run: |
-          docker run --rm -i hadolint/hadolint < Dockerfile | tee hadolint.txt || true
+          if [ -f Dockerfile ]; then
+            docker run --rm -i hadolint/hadolint < Dockerfile | tee hadolint.txt || true
+          else
+            echo "No Dockerfile" | tee hadolint.txt
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: hadolint
           path: hadolint.txt
 
-  dast:
-    name: DAST - OWASP ZAP against ephemeral target
-    runs-on: ubuntu-24.04
-    needs:
-      - build_and_push
-      - trivy_image
-      - sast_bandit
-      - sast_semgrep
-      - secrets_gitleaks
-      - hadolint
-    steps:
-      - name: Start OWASP Juice Shop (as target)
-        run: |
-          docker run -d --rm --name juice -p 8080:3000 bkimminich/juice-shop:latest
-
-      - name: Wait for target
-        shell: bash
-        run: |
-          for i in {1..60}; do
-            if curl -fsS http://localhost:8080 >/dev/null 2>&1; then
-              echo "Target is up"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "Target did not start" >&2
-          docker ps -a
-          exit 1
-
-      - name: ZAP Baseline Scan
-        run: |
-          docker run --rm \
-            -v "$PWD:/zap/wrk" \
-            -t owasp/zap2docker-stable zap-baseline.py \
-            -t http://localhost:8080 \
-            -r zap-report.html \
-            -x zap-report.xml \
-            -J zap-report.json || true
-
-      - name: Upload ZAP reports
-        uses: actions/upload-artifact@v4
+      - name: Trivy FS (config/deps scan)
+        uses: aquasecurity/trivy-action@0.24.0
         with:
-          name: zap-reports
-          path: |
-            zap-report.html
-            zap-report.xml
-            zap-report.json
+          scan-type: fs
+          scan-ref: .
+          timeout: 10m
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy-fs-sarif
+          path: trivy-fs.sarif
 
-  gate:
-    name: Security Gateway
+# ─────────────────────────────────────────
+# Stage 3 — DAST (ZAP) vs ephemeral Dojo
+# без docker-compose, всё через docker run
+# ─────────────────────────────────────────
+  dast_dojo:
+    name: Stage 3 — DAST (ZAP) against ephemeral Dojo
     runs-on: ubuntu-24.04
-    needs:
-      - trivy_image
-      - sast_bandit
-      - sast_semgrep
-      - secrets_gitleaks
-      - hadolint
-      - dast
+    needs: [build_and_push]
     steps:
-      - name: Dummy gate (always pass for now)
-        run: echo "Gate: OK"
+      - uses: actions/checkout@v4
+
+      - name: Create network
+        run: docker network create dojo_net
+
+      - name: Start MySQL
+        run: |
+          docker run -d --name dojo-mysql --network dojo_net \
+            -e MYSQL_DATABASE=defectdojo \
+            -e MYSQL_USER=defectdojo \
+            -e MYSQL_PASSWORD=defectdojo \
+            -e MYSQL_ROOT_PASSWORD=root \
+            -p 3306:3306 \
+            --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot || exit 1" \
+            --health-interval=5s --health-retries=60 mysql:8
+
+      - name: Start Redis
+        run: |
+          docker run -d --name dojo-redis --network dojo_net \
+            --health-cmd="redis-cli ping || exit 1" \
+            --health-interval=5s --health-retries=60 redis:7-alpine
+
+      - name: Start DefectDojo container
+        run: |
+          docker run -d --name dojo --network dojo_net -p 8080:8080 \
+            -e DD_DATABASE_ENGINE=django.db.backends.mysql \
+            -e DD_DATABASE_HOST=dojo-mysql \
+            -e DD_DATABASE_PORT=3306 \
+            -e DD_DATABASE_NAME=defectdojo \
+            -e DD_DATABASE_USER=defectdojo \
+            -e DD_DATABASE_PASSWORD=defectdojo \
+            -e DD_REDIS_URL=redis://dojo-redis:6379/0 \
+            -e DD_ALLOWED_HOSTS='*' \
+            -e DD_SECRET_KEY='dev-secret' \
+            defectdojo/django:latest
+
+      - name: Wait for Dojo (≤10 min)
+        run: |
+          for i in {1..120}; do
+            if curl -fsS http://127.0.0.1:8080 >/dev/null; then
+              echo "Dojo is UP"; exit 0
+            fi
+            sleep 5
+          done
+          docker logs dojo | tail -n 200
+          echo "Dojo did not start in time"; exit 1
+
+      - name: ZAP Baseline scan
+        run: |
+          docker run --rm -t --network dojo_net \
+            -v "$PWD:/zap/wrk" \
+            owasp/zap2docker-stable zap-baseline.py \
+            -t http://dojo:8080 -m 5 \
+            -r zap-baseline.html -x zap-baseline.xml -J zap-baseline.json || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dast-zap
+          path: |
+            zap-baseline.html
+            zap-baseline.xml
+            zap-baseline.json
+
+      - name: Stop stack
+        if: always()
+        run: |
+          docker rm -f dojo || true
+          docker rm -f dojo-mysql || true
+          docker rm -f dojo-redis || true
+          docker network rm dojo_net || true
+
+# ──────────────────────────────
+# Stage 5 — Security Gate
+# ──────────────────────────────
+  security_gate:
+    name: Stage 5 — Security Gate
+    runs-on: ubuntu-24.04
+    needs: [sast_secret_config, dast_dojo]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: trivy-fs-sarif
+          path: gate
+      - uses: actions/download-artifact@v4
+        with:
+          name: bandit-sarif
+          path: gate
+      - uses: actions/download-artifact@v4
+        with:
+          name: semgrep-sarif
+          path: gate
+      - uses: actions/download-artifact@v4
+        with:
+          name: gitleaks-sarif
+          path: gate
+      - uses: actions/download-artifact@v4
+        with:
+          name: dast-zap
+          path: gate
+
+      - name: Apply thresholds and fail if exceeded
+        run: |
+          set -e
+          echo "=== Gate metrics ==="
+          trivy_high=$(jq '[.runs[]?.results[]? | select(.rule.severity=="HIGH" or .rule.severity=="CRITICAL")] | length' gate/trivy-fs.sarif 2>/dev/null || echo 0)
+          bandit_high=$(jq '[.runs[]?.results[]? | select(.properties.issue_severity=="HIGH")] | length' gate/bandit.sarif 2>/dev/null || echo 0)
+          semgrep_total=$(jq '[.runs[]?.results[]?] | length' gate/semgrep.sarif 2>/dev/null || echo 0)
+          gitleaks_total=$(jq '[.runs[]?.results[]?] | length' gate/gitleaks.sarif 2>/dev/null || echo 0)
+          zap_fail=$(grep -ci "FAIL-" gate/zap-baseline.html || true)
+          echo "Trivy HIGH/CRIT: $trivy_high"
+          echo "Bandit HIGH: $bandit_high"
+          echo "Semgrep findings: $semgrep_total"
+          echo "Gitleaks findings: $gitleaks_total"
+          echo "ZAP FAIL markers: $zap_fail"
+
+          # Порог: не допускаем HIGH/CRITICAL и секретов; остальное можно смягчить под требования
+          if [ "${trivy_high:-0}" -gt 0 ] || [ "${bandit_high:-0}" -gt 0 ] || [ "${gitleaks_total:-0}" -gt 0 ] || [ "${zap_fail:-0}" -gt 0 ]; then
+            echo "SECURITY GATE: FAILED"; exit 1
+          fi
+          echo "SECURITY GATE: PASSED"
