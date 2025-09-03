@@ -175,16 +175,15 @@ jobs:
 
 
   # ===================================================
-  # Stage 3 — DAST (можно оставить как placeholder)
+  # Stage 3 — DAST 
   # ===================================================
-  dast:
-    name: Stage 3 – DAST (placeholder)
-    runs-on: ubuntu-24.04
-    needs: build_and_push
-    steps:
-      - uses: actions/checkout@v4
-      - name: DAST placeholder
-        run: echo "DAST step can run ZAP here (disabled for Actions runners demo)."
+      - name: Run ZAP Baseline
+        uses: zaproxy/action-baseline@v0.9.0
+        with:
+          target: "http://localhost:8080"
+          rules_file_name: .zap/rules.tsv
+          cmd_options: "-a"
+
 
   # =========================
   # Stage 5 — Security Gate
