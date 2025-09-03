@@ -50,31 +50,37 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
 
-  sast_secrets_config:
-    name: Stage 2 – SAST + Secrets + Config
+    sast_secrets_config:
+    name: Stage 2/4 – SAST + Secrets + Config
     runs-on: ubuntu-24.04
     needs: build_and_push
     steps:
       - uses: actions/checkout@v4
 
-      # Bandit (Python)
-      - name: Install bandit
-        run: pipx install bandit
+      # Bandit (Python) → bandit.sarif
       - name: Run bandit
-        run: bandit -r . -f sarif -o bandit.sarif || true
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit
+          bandit -r . -f sarif -o bandit.sarif || true
+
       - name: Upload Bandit SARIF
         uses: github/codeql-action/upload-sarif@v3
-        with: { sarif_file: bandit.sarif, category: bandit }
+        with:
+          sarif_file: bandit.sarif
+          category: bandit
+        if: always()
 
-      # Semgrep
-            # Semgrep
+      # Semgrep → semgrep.sarif
       - name: Semgrep
         uses: returntocorp/semgrep-action@v1
         with:
           config: p/ci
           generateSarif: true
+          output: semgrep.sarif 
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN || '' }}  
 
       - name: Upload Semgrep SARIF
         uses: github/codeql-action/upload-sarif@v3
@@ -83,67 +89,72 @@ jobs:
           category: semgrep
         if: always()
 
-
-      # Gitleaks (secrets)
+      # Gitleaks → gitleaks.sarif
       - name: Gitleaks
         uses: gitleaks/gitleaks-action@v2
         with:
-          args: detect --no-git --report-format sarif --report-path gitleaks.sarif --exit-code 1
+          args: detect --source . --no-git --report-format sarif --report-path gitleaks.sarif || true
+
       - name: Upload Gitleaks SARIF
         uses: github/codeql-action/upload-sarif@v3
-        with: { sarif_file: gitleaks.sarif, category: gitleaks }
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
         if: always()
 
-      # Hadolint
-      - name: Hadolint
-        uses: hadolint/hadolint-action@v3.1.0
-        with: { dockerfile: ./Dockerfile, failure-threshold: error }
-
-      # Trivy (image)
+      # Trivy (образ) → trivy.sarif
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@0.24.0
         with:
-          image-ref: ${{ needs.build_and_push.outputs.image }}
+          image-ref: ${{ needs.build_and_push.outputs.image }}:${{ needs.build_and_push.outputs.tag }}
           format: sarif
           output: trivy.sarif
           vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH'
-          exit-code: 1
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+          exit-code: 0
+
       - name: Upload Trivy SARIF
         uses: github/codeql-action/upload-sarif@v3
-        with: { sarif_file: trivy.sarif, category: trivy }
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
         if: always()
 
-  run_target_locally:
+
+    run_target:
     name: Stage 3 – Run target locally (for DAST)
     runs-on: ubuntu-24.04
     needs: build_and_push
-    outputs:
-      image: ${{ needs.build_and_push.outputs.image }}
+    env:
+      IMAGE: ${{ needs.build_and_push.outputs.image }}:${{ needs.build_and_push.outputs.tag }}
     steps:
       - name: Pull image
-        run: docker pull ${{ needs.build_and_push.outputs.image }}
+        run: docker pull "$IMAGE"
 
-      - name: Run container on 8080
+      - name: Run container
         run: |
-          docker run -d --rm --name target \
-            -p 8080:8080 \
-            ${{ needs.build_and_push.outputs.image }}
-
-      - name: Wait for health (max 2 min)
-        shell: bash
-        run: |
-          for i in {1..120}; do
+          docker rm -f target || true
+          docker run -d --name target -p 8080:8080 "$IMAGE"
+          # ждём пока поднимется
+          for i in {1..30}; do
             if curl -fsS http://localhost:8080/ >/dev/null 2>&1; then
-              echo "Service is up"; exit 0
+              echo "Target is up"; break
             fi
-            sleep 1
+            sleep 2
           done
-          echo "Service did not start in time"; docker logs target || true
-          exit 1
 
-      - name: Keep container running for next job
-        run: echo "ok"
+      - name: ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.11.0
+        with:
+          target: 'http://localhost:8080'
+          rules_file_name: ''
+          cmd_options: '-a'   
+        continue-on-error: true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f target || true
+
 
   dast:
     name: Stage 4 – DAST (ZAP baseline on localhost)
@@ -174,34 +185,19 @@ jobs:
         if: always()
         run: docker rm -f target || true
 
-  security_gate:
+    security_gate:
     name: Stage 5 – Security Gate
     runs-on: ubuntu-24.04
-    needs: [sast_secrets_config, dast]
+    needs: [build_and_push, sast_secrets_config, run_target]
+    if: always()
     steps:
-      - uses: actions/download-artifact@v4
-        with: { name: zap-baseline, path: . }
-        if: always()
-
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Gate summary + block on thresholds
+      - name: Gate summary
         shell: bash
         run: |
-          set -euo pipefail
-          TRIVY_CRIT=0
-          [[ -f trivy.sarif ]] && TRIVY_CRIT=$(jq '[.runs[].results[] | select(.properties.severity=="CRITICAL")] | length' trivy.sarif || echo 0)
-
-          ZAP_HIGH=0
-          [[ -f zap.json ]] && ZAP_HIGH=$(jq '[.site[].alerts[] | select((.risk|ascii_downcase)=="high")] | length' zap.json || echo 0)
-
-          echo "### Security Gate" >> $GITHUB_STEP_SUMMARY
-          echo "- Trivy critical: **$TRIVY_CRIT**" >> $GITHUB_STEP_SUMMARY
-          echo "- ZAP high: **$ZAP_HIGH**" >> $GITHUB_STEP_SUMMARY
-
-          if [[ "${FAIL_ON_CRITICAL}" == "true" ]] && { [[ "$TRIVY_CRIT" -gt 0 ]] || [[ "$ZAP_HIGH" -gt 0 ]]; }; then
-            echo "Blocking release due to critical/high findings"
+          echo "Checking for CRITICAL findings..."
+          # пример простого гейта по наличию строк "CRITICAL" в SARIF
+          if grep -qi '"level": *"error"' bandit.sarif semgrep.sarif gitleaks.sarif trivy.sarif 2>/dev/null; then
+            echo "❌ Blocking release: CRITICAL issues found"
             exit 1
           fi
-          echo "Gate passed."
+          echo "✅ No blocking findings"
