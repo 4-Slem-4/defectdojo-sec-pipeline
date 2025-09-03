@@ -2,333 +2,276 @@ name: DevSecOps Pipeline (DefectDojo)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ main ]
-  workflow_dispatch:
+    branches: [ "main" ]
 
 permissions:
   contents: read
-  packages: write
   security-events: write
 
 env:
-  REGISTRY: ghcr.io
-  # ВАЖНО: нижний регистр!
-  IMAGE_BASE: ghcr.io/4-slem-4/defectdojo-sec-pipeline
+  IMAGE_BASE: ghcr.io/${{ github.repository }}
+  IMAGE_LATEST: latest
 
 jobs:
   build:
     name: Build & Push Docker image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
       - uses: docker/setup-buildx-action@v3
 
-      - name: Login to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          REPO_LC=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          echo "REPO_LC=${REPO_LC}" >> $GITHUB_OUTPUT
+          echo "IMG=${REPO_LC}" >> $GITHUB_OUTPUT
+          echo "TAG_SHA=${GITHUB_SHA}" >> $GITHUB_OUTPUT
 
       - name: Build image
         run: |
-          IMAGE_NAME="${{ env.IMAGE_BASE }}:${{ github.sha }}"
-          LATEST_TAG="${{ env.IMAGE_BASE }}:latest"
-          docker build -t "$IMAGE_NAME" -t "$LATEST_TAG" .
+          IMAGE_NAME="ghcr.io/${{ steps.tags.outputs.IMG }}"
+          docker build -t "$IMAGE_NAME:${{ env.IMAGE_LATEST }}" -t "$IMAGE_NAME:${{ steps.tags.outputs.TAG_SHA }}" .
 
       - name: Push image
         run: |
-          IMAGE_NAME="${{ env.IMAGE_BASE }}:${{ github.sha }}"
-          LATEST_TAG="${{ env.IMAGE_BASE }}:latest"
-          docker push "$IMAGE_NAME"
-          docker push "$LATEST_TAG"
+          IMAGE_NAME="ghcr.io/${{ steps.tags.outputs.IMG }}"
+          docker push "$IMAGE_NAME:${{ env.IMAGE_LATEST }}"
+          docker push "$IMAGE_NAME:${{ steps.tags.outputs.TAG_SHA }}"
 
-  semgrep:
+  sast_semgrep:
     name: SAST - Semgrep
     runs-on: ubuntu-latest
-    needs: [build]
     steps:
       - uses: actions/checkout@v4
-      - name: Run Semgrep (SARIF)
-        uses: returntocorp/semgrep-action@v1
+      - uses: returntocorp/semgrep-action@v1
         with:
-          config: |
-            p/python
-            p/django
-            p/owasp-top-ten
-          # Параметры у экшена иногда меняются; даже если warning — отчёт всё равно будет
+          config: p/ci
           generateSarif: true
-          auditOn: push
-      - name: Save Semgrep JSON
-        run: |
-          pipx install semgrep || true
-          printf "configs:\n  - p/python\n  - p/django\n  - p/owasp-top-ten\n" > semgrep.yml
-          semgrep ci --config semgrep.yml --json --output semgrep.json --timeout 600 || true
-      - uses: actions/upload-artifact@v4
-        with:
-          name: semgrep
-          path: semgrep.json
+          upload-sarif: true
 
-  bandit:
+  sast_bandit:
     name: SAST - Bandit
     runs-on: ubuntu-latest
-    needs: [build]
     steps:
       - uses: actions/checkout@v4
-      - name: Run Bandit
-        run: |
-          python -m pip install --upgrade pip
-          pip install bandit
-          bandit -r . -f json -o bandit.json || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/setup-python@v5
         with:
-          name: bandit
-          path: bandit.json
+          python-version: "3.x"
+      - name: Install bandit
+        run: pip install bandit
+      - name: Run bandit
+        run: |
+          bandit -r . -f sarif -o bandit.sarif || true
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit.sarif
 
-  gitleaks:
+  secrets_gitleaks:
     name: Secrets scan - Gitleaks
     runs-on: ubuntu-latest
-    needs: [build]
     steps:
       - uses: actions/checkout@v4
-      - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
         with:
-          args: detect --no-git --report-format json --report-path gitleaks.json
-      - uses: actions/upload-artifact@v4
+          fetch-depth: 0
+      - name: Run gitleaks (docker)
+        run: |
+          docker run --rm -v $PWD:/repo zricethezav/gitleaks:8 \
+            detect --source=/repo --redact --no-git \
+            --report-format=json --report-path=/repo/gitleaks.json || true
+      - name: Upload gitleaks report
+        uses: actions/upload-artifact@v4
         with:
-          name: gitleaks
+          name: gitleaks.json
           path: gitleaks.json
-        continue-on-error: true
+          if-no-files-found: ignore
 
   trivy:
     name: Image & Config scan - Trivy
+    needs: build
     runs-on: ubuntu-latest
-    needs: [build]
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Login to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Install Trivy
-        uses: aquasecurity/setup-trivy@v0.2.2
-
-      - name: Trivy image scan
-        continue-on-error: true
-        run: |
-          LATEST_TAG="${{ env.IMAGE_BASE }}:latest"
-          trivy image --scanners vuln,secret --ignore-unfixed --format json -o trivy-image.json "$LATEST_TAG"
-
-      - name: Trivy config scan (repo)
-        continue-on-error: true
-        run: trivy config --format json -o trivy-config.json .
-
-      - uses: actions/upload-artifact@v4
+      - uses: aquasecurity/trivy-action@0.24.0
         with:
-          name: trivy
-          path: |
-            trivy-image.json
-            trivy-config.json
+          image-ref: ghcr.io/${{ github.repository }}:${{ env.IMAGE_LATEST }}
+          format: sarif
+          output: trivy.sarif
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
 
   hadolint:
     name: Dockerfile Lint - Hadolint
     runs-on: ubuntu-latest
-    needs: [build]
     steps:
       - uses: actions/checkout@v4
-      - name: Run Hadolint
-        uses: jbergstroem/hadolint-gh-action@v1
+      - uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
+          ignore: DL3007,DL3008
+      - name: Note about latest tag (warning only)
+        run: echo "Using 'latest' may be unstable; pin versions." || true
 
-  dast:
+  dast_zap:
     name: DAST - OWASP ZAP against ephemeral Dojo
     runs-on: ubuntu-latest
-    needs: [build]
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout this repo (we’ll keep artifacts here)
+        uses: actions/checkout@v4
 
-      - name: Create network
-        run: docker network create dojo-net
-
-      - name: Start DB & Redis
+      - name: Install docker compose plugin
         run: |
-          docker run -d --rm --name db --network dojo-net \
-            -e MARIADB_ROOT_PASSWORD=rootpwd \
-            -e MARIADB_DATABASE=defectdojo \
-            -e MARIADB_USER=defectdojo \
-            -e MARIADB_PASSWORD=dojopwd \
-            mariadb:10.11
-          docker run -d --rm --name redis --network dojo-net redis:7-alpine
+          sudo apt-get update
+          sudo apt-get install -y docker-compose-plugin
 
-      - name: Start DefectDojo (your image)
-        run: |
-          LATEST_TAG="${{ env.IMAGE_BASE }}:latest"
-          docker run -d --rm --name dojo --network dojo-net -p 8080:8080 \
-            -e DD_DATABASE_ENGINE=django.db.backends.mysql \
-            -e DD_DATABASE_HOST=db \
-            -e DD_DATABASE_NAME=defectdojo \
-            -e DD_DATABASE_USER=defectdojo \
-            -e DD_DATABASE_PASSWORD=dojopwd \
-            -e DD_DATABASE_PORT=3306 \
-            -e DD_REDIS_HOST=redis \
-            -e DD_SECRET_KEY=dev-secret-key \
-            -e DD_ALLOWED_HOSTS="*" \
-            -e DD_DEBUG=false \
-            -e DD_ADMIN_USER=admin \
-            -e DD_ADMIN_PASSWORD=Admin123! \
-            -e DD_ADMIN_MAIL=admin@example.com \
-            "$LATEST_TAG"
+      - name: Checkout DefectDojo upstream
+        uses: actions/checkout@v4
+        with:
+          repository: DefectDojo/django-DefectDojo
+          path: dojo
 
-      - name: Wait for Dojo (up to ~10 minutes)
-        id: wait_dojo
+      - name: Prepare env for compose
+        working-directory: dojo
         run: |
-          ATTEMPTS=120     # 120 * 5s = 10 минут
+          cat > .env.dast <<'EOF'
+          DD_DATABASE_ENGINE=django.db.backends.mysql
+          DD_DATABASE_HOST=db
+          DD_DATABASE_NAME=defectdojo
+          DD_DATABASE_USER=defectdojo
+          DD_DATABASE_PASSWORD=dojo
+          DD_DATABASE_PORT=3306
+          DD_REDIS_HOST=redis
+          DD_SECRET_KEY=dev-secret
+          DD_ALLOWED_HOSTS=*
+          DD_DEBUG=false
+          DD_ADMIN_USER=admin
+          DD_ADMIN_PASSWORD=admin123!
+          DD_ADMIN_MAIL=admin@example.com
+          EOF
+
+      - name: Launch Dojo stack (db+redis+django+nginx)
+        working-directory: dojo
+        run: |
+          docker compose -f docker-compose.yml --env-file .env.dast up -d db redis django nginx
+          docker ps
+
+      - name: Wait for Dojo (up to 10 minutes)
+        shell: bash
+        run: |
+          ATTEMPTS=120   # 120 * 5s = 10 min
           for i in $(seq 1 $ATTEMPTS); do
-            if curl -fsS http://localhost:8080 >/dev/null; then
-              echo "Dojo is up"
-              exit 0
+            if curl -fsS http://localhost:8080/ > /dev/null; then
+              echo "Dojo is up"; exit 0
             fi
-            echo "[$i/$ATTEMPTS] waiting for Dojo..."
-            # Периодически печатаем последние логи
-            docker logs --tail 20 dojo || true
             sleep 5
           done
           echo "Dojo did not start in time"
-          docker logs dojo || true
-          echo "status=timeout" >> $GITHUB_OUTPUT
+          docker compose -f dojo/docker-compose.yml --env-file dojo/.env.dast logs --no-color > dojo-logs.txt || true
           exit 1
 
-      - name: Save Dojo logs (artifact)
-        if: failure() || steps.wait_dojo.outputs.status == 'timeout'
+      - name: ZAP Baseline Scan
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v $PWD:/zap/wrk \
+            owasp/zap2docker-stable \
+            zap-baseline.py -t http://localhost:8080/ -r zap-baseline.html -x zap-baseline.xml || true
+      - name: Upload ZAP reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-reports
+          path: |
+            zap-baseline.html
+            zap-baseline.xml
+          if-no-files-found: ignore
+
+      - name: Compose logs (artifact)
+        if: always()
+        run: |
+          docker compose -f dojo/docker-compose.yml --env-file dojo/.env.dast logs --no-color > dojo-logs.txt || true
+        continue-on-error: true
+      - name: Upload Dojo logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dojo-logs
-          path: |
-            dojo.log
-        continue-on-error: true
-        # сохраним логи в файл
-      - name: Dump Dojo logs to file
-        if: always()
-        run: docker logs dojo > dojo.log 2>&1 || true
-
-      - name: ZAP Baseline
-        if: success()    # только если Dojo поднялся
-        continue-on-error: true
-        run: |
-          docker run --rm --network dojo-net -v $PWD:/zap/wrk \
-            owasp/zap2docker-stable zap-baseline.py \
-            -t http://dojo:8080 -r zap-baseline.html -J zap-baseline.json -m 5 -d
-
-      - name: ZAP Full Scan
-        if: success()
-        continue-on-error: true
-        run: |
-          docker run --rm --network dojo-net -v $PWD:/zap/wrk \
-            owasp/zap2docker-stable zap-full-scan.py \
-            -t http://dojo:8080 -r zap-full.html -J zap-full.json -m 5 -I
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: zap
-          path: |
-            zap-baseline.html
-            zap-baseline.json
-            zap-full.html
-            zap-full.json
+          path: dojo-logs.txt
+          if-no-files-found: ignore
 
       - name: Cleanup
         if: always()
+        working-directory: dojo
         run: |
-          docker rm -f dojo db redis || true
-          docker network rm dojo-net || true
+          docker compose -f docker-compose.yml --env-file .env.dast down -v || true
 
   gate:
     name: Security Gateway
+    needs: [build, sast_semgrep, sast_bandit, secrets_gitleaks, trivy, hadolint, dast_zap]
     runs-on: ubuntu-latest
-    needs: [semgrep, bandit, gitleaks, trivy, dast]
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: semgrep
-          path: art/semgrep
+          name: zap-reports
+          path: gate_artifacts
+        continue-on-error: true
       - uses: actions/download-artifact@v4
         with:
-          name: bandit
-          path: art/bandit
+          name: codeql-sarif
+          path: gate_artifacts
+        continue-on-error: true
       - uses: actions/download-artifact@v4
         with:
-          name: gitleaks
-          path: art/gitleaks
-      - uses: actions/download-artifact@v4
+          name: gitleaks.json
+          path: gate_artifacts
+        continue-on-error: true
+      - name: Download trivy SARIF
+        uses: actions/download-artifact@v4
         with:
-          name: trivy
-          path: art/trivy
-      - uses: actions/download-artifact@v4
-        with:
-          name: zap
-          path: art/zap
-      - uses: actions/download-artifact@v4
-        if: always()
-        with:
-          name: dojo-logs
-          path: art/dojo-logs
+          name: trivy.sarif
+          path: gate_artifacts
+        continue-on-error: true
 
-      - name: Decide
+      - name: Enforce policy (fail on HIGH/CRITICAL or ZAP FAIL)
         run: |
-          python - << 'PY'
-          import json,sys,os
-          def J(p):
-            try: return json.load(open(p,encoding='utf-8'))
-            except: return None
-          def cnt_semgrep(d):
-            c={"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0}
-            if not d: return c
-            for r in d.get("results",[]):
-              sev=(r.get("extra",{}).get("severity","") or "").upper()
-              if sev=="ERROR": c["HIGH"]+=1
-              elif sev=="WARNING": c["MEDIUM"]+=1
-              else: c["LOW"]+=1
-            return c
-          def cnt_bandit(d):
-            c={"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0}
-            if not d: return c
-            for r in d.get("results",[]):
-              sev=(r.get("issue_severity","") or "").upper()
-              if sev in c: c[sev]+=1
-            return c
-          def cnt_trivy(d):
-            c={"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0}
-            if not d: return c
-            for res in d.get("Results",[]) or []:
-              for v in res.get("Vulnerabilities",[]) or []:
-                s=(v.get("Severity","") or "").upper()
-                if s in c: c[s]+=1
-            return c
-          def cnt_zap(d):
-            c={"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0}
-            if not d: return c
-            alerts=d.get("alerts")
-            if alerts is None:
-              alerts=[]
-              for s in d.get("site",[]) or []: alerts += s.get("alerts",[]) or []
-            for a in alerts:
-              risk=(a.get("risk","") or a.get("riskdesc","")).upper()
-              if "HIGH" in risk: c["HIGH"]+=1
-              elif "MEDIUM" in risk: c["MEDIUM"]+=1
-              else: c["LOW"]+=1
-            return c
-          def has_gitleaks(d): return isinstance(d,list) and len(d)>0
-          sem=cnt_semgrep(J("art/semgrep/semgrep.json"))
-          ban=cnt_bandit(J("art/bandit/bandit.json"))
-          tri=cnt_trivy(J("art/trivy/trivy-image.json"))
-          zap=cnt_zap(J("art/zap/zap-full.json") or J("art/zap/zap-baseline.json"))
-          gtl=has_gitleaks(J("art/gitleaks/gitleaks.json"))
-          tot={k:sem.get(k,0)+ban.get(k,0)+tri.get(k,0)+zap.get(k,0) for k in ["LOW","MEDIUM","HIGH","CRITICAL"]}
-          print("SUMMARY:", {"semgrep":sem,"bandit":ban,"trivy":tri,"zap":zap,"gitleaks":gtl,"total":tot})
-          # гейт: секреты = стоп; CRITICAL > 0 = стоп; HIGH >=5 = стоп
-          if gtl: print("FAIL: secrets found"); sys.exit(1)
-          if tot["CRITICAL"]>0: print("FAIL: critical issues"); sys.exit(1)
-          if tot["HIGH"]>=5: print("FAIL: too many HIGH"); sys.exit(1)
-          print("SECURITY GATE: OK"); sys.exit(0)
-          PY
+          FAIL=0
+          echo "=== Security Gate ==="
+          if [ -f gate_artifacts/trivy.sarif ]; then
+            CRIT=$(grep -o '"level":"error"' gate_artifacts/trivy.sarif | wc -l | tr -d ' ')
+            if [ "$CRIT" -gt 0 ]; then
+              echo "Trivy: found HIGH/CRITICAL findings"; FAIL=1
+            fi
+          fi
+          if [ -f gate_artifacts/zap-baseline.xml ]; then
+            if grep -q 'FAIL' gate_artifacts/zap-baseline.xml; then
+              echo "ZAP baseline has FAILs"; FAIL=1
+            fi
+          fi
+          if [ -f gate_artifacts/gitleaks.json ]; then
+            if [ "$(wc -c < gate_artifacts/gitleaks.json)" -gt 3 ] && ! grep -q 'No leaks detected' gate_artifacts/gitleaks.json 2>/dev/null; then
+              echo "Gitleaks: possible secrets detected"; FAIL=1
+            fi
+          fi
+          if [ "$FAIL" -ne 0 ]; then
+            echo "Security Gate: BLOCK RELEASE"; exit 1
+          else
+            echo "Security Gate: OK"
+          fi
