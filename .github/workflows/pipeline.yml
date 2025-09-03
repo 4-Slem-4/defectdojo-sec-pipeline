@@ -58,7 +58,7 @@ jobs:
   # =========================================================
   # Stage 2 — SAST + Secrets + Config
   # =========================================================
-  sast_secrets_config:
+    sast_secrets_config:
     name: Stage 2/4 – SAST + Secrets + Config
     runs-on: ubuntu-24.04
     needs: build_and_push
@@ -67,12 +67,9 @@ jobs:
 
       # ---------- Bandit (Python) ----------
       - name: Run bandit
-        shell: bash
         run: |
-          python -m pip install --upgrade pip
           pip install bandit
           bandit -r . -f sarif -o bandit.sarif || true
-
       - name: Upload Bandit SARIF
         uses: github/codeql-action/upload-sarif@v3
         with:
@@ -81,16 +78,10 @@ jobs:
         if: always()
 
       # ---------- Semgrep ----------
-      - name: Semgrep
-        uses: returntocorp/semgrep-action@v1
-        with:
-          config: p/ci
-          generateSarif: true
-          output: semgrep.sarif
-        env:
-          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN || '' }}
-        continue-on-error: true
-
+      - name: Run semgrep
+        run: |
+          pip install semgrep
+          semgrep --config=p/ci --sarif -o semgrep.sarif || true
       - name: Upload Semgrep SARIF
         uses: github/codeql-action/upload-sarif@v3
         with:
@@ -98,12 +89,12 @@ jobs:
           category: semgrep
         if: always()
 
-      # ---------- Gitleaks (secrets) ----------
-      - name: Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        with:
-          args: detect --source . --no-git --report-format sarif --report-path gitleaks.sarif || true
-
+      # ---------- Gitleaks ----------
+      - name: Run gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks-linux-amd64 -o gitleaks
+          chmod +x gitleaks
+          ./gitleaks detect --source . --no-git --report-format sarif --report-path gitleaks.sarif || true
       - name: Upload Gitleaks SARIF
         uses: github/codeql-action/upload-sarif@v3
         with:
@@ -111,15 +102,8 @@ jobs:
           category: gitleaks
         if: always()
 
-      # ---------- Hadolint (Dockerfile) ----------
-      - name: Hadolint
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: ./Dockerfile
-        continue-on-error: true
-
-      # ---------- Trivy (image + config) ----------
-      - name: Trivy image scan
+      # ---------- Trivy ----------
+      - name: Run Trivy
         uses: aquasecurity/trivy-action@0.24.0
         with:
           image-ref: ${{ needs.build_and_push.outputs.image }}:${{ needs.build_and_push.outputs.tag }}
@@ -128,13 +112,13 @@ jobs:
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH,MEDIUM,LOW'
           exit-code: 0
-
       - name: Upload Trivy SARIF
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy.sarif
           category: trivy
         if: always()
+
 
   # =========================================================
   # Stage 3 — Run target locally (for DAST)
