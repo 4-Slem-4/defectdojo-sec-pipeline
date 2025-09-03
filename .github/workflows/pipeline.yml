@@ -13,6 +13,10 @@ permissions:
 
 env:
   FAIL_ON_CRITICAL: "true"  
+  MAX_HIGH: "0"              
+  MAX_MEDIUM: "5"            
+  MAX_LOW: "99999"           
+  TARGET_PORT: "8080" 
 
 jobs:
   # =========================
@@ -65,10 +69,8 @@ jobs:
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
             ${{ steps.meta.outputs.image }}:latest
 
+
   # ==========================================
-  # Stage 2 — SAST + Secrets + Config (SARIF)
-  # ==========================================
-    # ==========================================
   # Stage 2 — SAST + Secrets + Config (SARIF)
   # ==========================================
   sast_secrets_config:
@@ -193,8 +195,68 @@ jobs:
     needs: [build_and_push, sast_secrets_config, dast]
     if: always()
     steps:
-      - name: Gate summary
+      - name: Gate – parse SARIF and enforce thresholds
         shell: bash
         run: |
-          echo "Security Gate: здесь можно парсить *.sarif и падать по порогу."
-          echo "Сейчас пропускаем, чтобы пайплайн не падал на демо."
+          set -euo pipefail
+          echo "== Gate: parse *.sarif =="
+          ls -1 *.sarif 2>/dev/null || { echo "No SARIF files. Nothing to gate."; exit 0; }
+
+          # jq уже есть на ubuntu-24.04 runner
+          crit=0; high=0; med=0; low=0
+
+          parse_file() {
+            local f="$1"
+            echo "Parsing $f"
+            # Вытащим нормализованные «severity/level» из разных SARIF-вариантов
+            jq -r '
+              def sev:
+                ( .level //                       # общий уровень результата
+                  .rule?.properties?."security-severity" //
+                  .properties?."security-severity" //
+                  .severity //                    # встречается у некоторых
+                  .rule?.defaultConfiguration?.level //
+                  "warning"
+                ) | ascii_downcase;
+
+              .runs[].results[]? | sev
+            ' "$f"
+          }
+
+          for f in *.sarif; do
+            while read -r s; do
+              case "$s" in
+                critical|blocker) crit=$((crit+1));;
+                high|error)       high=$((high+1));;
+                medium|moderate)  med=$((med+1));;
+                low|warning|note) low=$((low+1));;
+                *)                low=$((low+1));;
+              esac
+            done < <(parse_file "$f")
+          done
+
+          echo "== Totals =="
+          echo "CRITICAL: $crit"
+          echo "HIGH    : $high"
+          echo "MEDIUM  : $med"
+          echo "LOW     : $low"
+
+          fail=false
+          if [[ "${FAIL_ON_CRITICAL,,}" == "true" && $crit -gt 0 ]]; then
+            echo "❌ Gate: CRITICAL found -> fail"; fail=true
+          fi
+          if (( high > ${MAX_HIGH:-0} )); then
+            echo "❌ Gate: HIGH ($high) > MAX_HIGH (${MAX_HIGH:-0})"; fail=true
+          fi
+          if (( med > ${MAX_MEDIUM:-0} )); then
+            echo "❌ Gate: MEDIUM ($med) > MAX_MEDIUM (${MAX_MEDIUM:-0})"; fail=true
+          fi
+          if (( low > ${MAX_LOW:-999999} )); then
+            echo "❌ Gate: LOW ($low) > MAX_LOW (${MAX_LOW:-999999})"; fail=true
+          fi
+
+          if [[ "$fail" == "true" ]]; then
+            exit 1
+          else
+            echo "✅ Gate: thresholds satisfied"
+          fi
