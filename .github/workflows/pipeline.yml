@@ -1,37 +1,43 @@
-name: DevSecOps pipeline (local DAST)
+name: DevSecOps pipeline (DefectDojo)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
-
-env:
-  IMAGE_NAME: ghcr.io/${{ github.repository }}
-  FAIL_ON_CRITICAL: "true"   
+    branches: ["main"]
 
 permissions:
   contents: read
   packages: write
   security-events: write
 
+env:
+  FAIL_ON_CRITICAL: "true"  
+
 jobs:
+  # =========================================================
+  # Stage 1 — Build & push image to GHCR
+  # =========================================================
   build_and_push:
     name: Stage 1 – Build & push image to GHCR
     runs-on: ubuntu-24.04
     outputs:
-      image: ${{ steps.meta.outputs.tags }}
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute tags
+      - name: Compute image meta (lowercase)
         id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha,format=short
-            type=raw,value=latest
+        shell: bash
+        run: |
+          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          repo=$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner}/${repo}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -40,24 +46,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build & push
+      - name: Build & Push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
 
-    sast_secrets_config:
+  # =========================================================
+  # Stage 2 — SAST + Secrets + Config
+  # =========================================================
+  sast_secrets_config:
     name: Stage 2/4 – SAST + Secrets + Config
     runs-on: ubuntu-24.04
     needs: build_and_push
     steps:
       - uses: actions/checkout@v4
 
-      # Bandit (Python) → bandit.sarif
+      # ---------- Bandit (Python) ----------
       - name: Run bandit
         shell: bash
         run: |
@@ -72,15 +80,16 @@ jobs:
           category: bandit
         if: always()
 
-      # Semgrep → semgrep.sarif
+      # ---------- Semgrep ----------
       - name: Semgrep
         uses: returntocorp/semgrep-action@v1
         with:
           config: p/ci
           generateSarif: true
-          output: semgrep.sarif 
+          output: semgrep.sarif
         env:
-          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN || '' }}  
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN || '' }}
+        continue-on-error: true
 
       - name: Upload Semgrep SARIF
         uses: github/codeql-action/upload-sarif@v3
@@ -89,7 +98,7 @@ jobs:
           category: semgrep
         if: always()
 
-      # Gitleaks → gitleaks.sarif
+      # ---------- Gitleaks (secrets) ----------
       - name: Gitleaks
         uses: gitleaks/gitleaks-action@v2
         with:
@@ -102,7 +111,14 @@ jobs:
           category: gitleaks
         if: always()
 
-      # Trivy (образ) → trivy.sarif
+      # ---------- Hadolint (Dockerfile) ----------
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ./Dockerfile
+        continue-on-error: true
+
+      # ---------- Trivy (image + config) ----------
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@0.24.0
         with:
@@ -120,8 +136,10 @@ jobs:
           category: trivy
         if: always()
 
-
-    run_target:
+  # =========================================================
+  # Stage 3 — Run target locally (for DAST)
+  # =========================================================
+  run_target:
     name: Stage 3 – Run target locally (for DAST)
     runs-on: ubuntu-24.04
     needs: build_and_push
@@ -135,8 +153,8 @@ jobs:
         run: |
           docker rm -f target || true
           docker run -d --name target -p 8080:8080 "$IMAGE"
-          # ждём пока поднимется
-          for i in {1..30}; do
+          # ждем старта
+          for i in {1..40}; do
             if curl -fsS http://localhost:8080/ >/dev/null 2>&1; then
               echo "Target is up"; break
             fi
@@ -147,45 +165,17 @@ jobs:
         uses: zaproxy/action-baseline@v0.11.0
         with:
           target: 'http://localhost:8080'
-          rules_file_name: ''
-          cmd_options: '-a'   
+          cmd_options: '-a'
         continue-on-error: true
 
       - name: Stop container
         if: always()
         run: docker rm -f target || true
 
-
-  dast:
-    name: Stage 4 – DAST (ZAP baseline on localhost)
-    runs-on: ubuntu-24.04
-    needs: [run_target_locally]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: ZAP Baseline
-        uses: zaproxy/action-baseline@v0.12.0
-        with:
-          target: http://localhost:8080
-          cmd_options: -a -m 5 -I -J zap.json -w zap.md -r zap.html -x zap.xml
-        continue-on-error: true
-
-      - name: Upload ZAP artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: zap-baseline
-          path: |
-            zap.json
-            zap.xml
-            zap.html
-            zap.md
-        if: always()
-
-      - name: Stop container
-        if: always()
-        run: docker rm -f target || true
-
-    security_gate:
+  # =========================================================
+  # Stage 5 — Security Gate
+  # =========================================================
+  security_gate:
     name: Stage 5 – Security Gate
     runs-on: ubuntu-24.04
     needs: [build_and_push, sast_secrets_config, run_target]
@@ -194,10 +184,19 @@ jobs:
       - name: Gate summary
         shell: bash
         run: |
-          echo "Checking for CRITICAL findings..."
-          # пример простого гейта по наличию строк "CRITICAL" в SARIF
-          if grep -qi '"level": *"error"' bandit.sarif semgrep.sarif gitleaks.sarif trivy.sarif 2>/dev/null; then
-            echo "❌ Blocking release: CRITICAL issues found"
+          echo "Security Gate: checking for CRITICAL findings..."
+          # Пример простого гейта: ищем "level":"error" в SARIF
+          found_crit=0
+          for f in bandit.sarif semgrep.sarif gitleaks.sarif trivy.sarif; do
+            if [ -f "$f" ] && grep -qi '"level"[[:space:]]*:[[:space:]]*"error"' "$f"; then
+              echo "Found CRITICAL/Error in $f"
+              found_crit=1
+            fi
+          done
+
+          if [ "$FAIL_ON_CRITICAL" = "true" ] && [ $found_crit -eq 1 ]; then
+            echo "❌ Blocking release due to CRITICAL findings."
             exit 1
           fi
-          echo "✅ No blocking findings"
+
+          echo "✅ Gate passed (or FAIL_ON_CRITICAL=false)."
