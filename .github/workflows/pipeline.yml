@@ -69,95 +69,95 @@ jobs:
   # Stage 2 — SAST + Secrets + Config (SARIF)
   # ==========================================
     sast_secrets_config:
-    name: Stage 2/4 – SAST + Secrets + Config
-    runs-on: ubuntu-24.04
-    needs: build_and_push
-    steps:
-      - uses: actions/checkout@v4
+      name: Stage 2/4 – SAST + Secrets + Config
+      runs-on: ubuntu-24.04
+      needs: build_and_push
+      steps:
+        - uses: actions/checkout@v4
 
       # Bandit (Python)
-      - name: Install Bandit
-        run: |
-          python3 -m pip install --upgrade pip
-          pip install bandit
-      - name: Run bandit
-        run: |
-          bandit -r . -f sarif -o bandit.sarif || true
+        - name: Install Bandit
+          run: |
+            python3 -m pip install --upgrade pip
+            pip install bandit
+        - name: Run bandit
+          run: |
+            bandit -r . -f sarif -o bandit.sarif || true
 
-      # Semgrep
-      - name: Run semgrep
-        uses: returntocorp/semgrep-action@v1
-        with:
-          config: p/ci
-          generateSarif: true
-        continue-on-error: true
-      - name: Normalize semgrep sarif name
-        run: |
-          # semgrep-action кладёт файл semgrep.sarif; на всякий случай нормализуем
-          if [ -f semgrep.sarif ]; then
-            :
-          elif [ -f results.sarif ]; then
-            mv results.sarif semgrep.sarif
-          fi
+        # Semgrep
+        - name: Run semgrep
+          uses: returntocorp/semgrep-action@v1
+          with:
+            config: p/ci
+            generateSarif: true
+          continue-on-error: true
+        - name: Normalize semgrep sarif name
+          run: |
+            # semgrep-action кладёт файл semgrep.sarif; на всякий случай нормализуем
+            if [ -f semgrep.sarif ]; then
+              :
+            elif [ -f results.sarif ]; then
+              mv results.sarif semgrep.sarif
+            fi
 
-      # Gitleaks (секреты)
-      - name: Run gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        with:
-          args: detect --source . --no-git --report-format sarif --report-path gitleaks.sarif --exit-code 0
-        continue-on-error: true
+        # Gitleaks (секреты)
+        - name: Run gitleaks
+          uses: gitleaks/gitleaks-action@v2
+          with:
+            args: detect --source . --no-git --report-format sarif --report-path gitleaks.sarif --exit-code 0
+          continue-on-error: true
 
-      # Hadolint (линт Dockerfile) 
-      - name: Hadolint
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: ./Dockerfile
-        continue-on-error: true
+        # Hadolint (линт Dockerfile) 
+        - name: Hadolint
+          uses: hadolint/hadolint-action@v3.1.0
+          with:
+            dockerfile: ./Dockerfile
+          continue-on-error: true
 
-      # Trivy
-      - name: Trivy image scan
-        uses: aquasecurity/trivy-action@0.24.0
-        with:
-          image-ref: ${{ needs.build_and_push.outputs.image }}:${{ needs.build_and_push.outputs.tag }}
-          format: sarif
-          output: trivy.sarif
-          vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
-          exit-code: 0
-        continue-on-error: true
+        # Trivy
+        - name: Trivy image scan
+          uses: aquasecurity/trivy-action@0.24.0
+          with:
+            image-ref: ${{ needs.build_and_push.outputs.image }}:${{ needs.build_and_push.outputs.tag }}
+            format: sarif
+            output: trivy.sarif
+            vuln-type: 'os,library'
+            severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+            exit-code: 0
+          continue-on-error: true
 
-      # Небольшая проверка чтобы сразу видеть, что файлы появились
-      - name: List SARIF files (debug)
-        run: ls -la *.sarif || true
+        # Небольшая проверка чтобы сразу видеть, что файлы появились
+        - name: List SARIF files (debug)
+          run: ls -la *.sarif || true
 
-      # Uploads
-      - name: Upload Bandit SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: bandit.sarif
-          category: bandit
+        # Uploads
+        - name: Upload Bandit SARIF
+          if: always()
+          uses: github/codeql-action/upload-sarif@v3
+          with:
+            sarif_file: bandit.sarif
+            category: bandit
 
-      - name: Upload Semgrep SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: semgrep.sarif
-          category: semgrep
+        - name: Upload Semgrep SARIF
+          if: always()
+          uses: github/codeql-action/upload-sarif@v3
+          with:
+            sarif_file: semgrep.sarif
+            category: semgrep
 
-      - name: Upload Gitleaks SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: gitleaks.sarif
-          category: gitleaks
+        - name: Upload Gitleaks SARIF
+          if: always()
+          uses: github/codeql-action/upload-sarif@v3
+          with:
+            sarif_file: gitleaks.sarif
+            category: gitleaks
 
-      - name: Upload Trivy SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy.sarif
-          category: trivy
+        - name: Upload Trivy SARIF
+          if: always()
+          uses: github/codeql-action/upload-sarif@v3
+          with:
+            sarif_file: trivy.sarif
+            category: trivy
 
 
   # ===================================================
