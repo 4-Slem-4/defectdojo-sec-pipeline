@@ -32,7 +32,7 @@ jobs:
         shell: bash
         run: |
           if [ ! -f Dockerfile ]; then
-            cat > Dockerfile <<'EOF'
+            cat > Dockerfile <<EOF
             FROM nginx:1.27.2-alpine
             RUN echo OK > /usr/share/nginx/html/healthz
             EXPOSE 80
