@@ -1,4 +1,4 @@
-name: DevSecOps pipeline (DefectDojo)
+name: DevSecOps pipeline (local DAST)
 
 on:
   push:
@@ -6,52 +6,32 @@ on:
   pull_request:
     branches: [ "main" ]
 
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  FAIL_ON_CRITICAL: "true"   
+
 permissions:
   contents: read
   packages: write
-
-env:
-  # Хочешь, чтобы Gate падал при CRITICAL? Поставь true.
-  FAIL_ON_CRITICAL: "false"
+  security-events: write
 
 jobs:
-  # ─────────────────────────────────────────────────────────────
-  # Stage 1 — Build & push image to GHCR
-  # ─────────────────────────────────────────────────────────────
   build_and_push:
-    name: Stage 1 - Build & push image to GHCR
+    name: Stage 1 – Build & push image to GHCR
     runs-on: ubuntu-24.04
     outputs:
-      image: ${{ steps.meta.outputs.image }}
-      tag:   ${{ steps.meta.outputs.tag }}
+      image: ${{ steps.meta.outputs.tags }}
     steps:
       - uses: actions/checkout@v4
 
-      # Если в репо нет Dockerfile — сгенерим простой
-      - name: Ensure Dockerfile (fallback)
-        shell: bash
-        run: |
-          if [ ! -f Dockerfile ]; then
-            printf '%s\n' \
-              'FROM nginx:1.27.2-alpine' \
-              'RUN echo OK > /usr/share/nginx/html/healthz' \
-              'EXPOSE 80' \
-              'CMD ["nginx","-g","daemon off;"]' > Dockerfile
-          fi
-
-
-      # Собираем имя образа в lowercase + короткий тег = SHA12
-      - name: Compute image meta (lowercase)
+      - name: Compute tags
         id: meta
-        shell: bash
-        run: |
-          owner="${GITHUB_REPOSITORY_OWNER,,}"
-          repo="$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
-          echo "image=ghcr.io/${owner}/${repo}" >> "$GITHUB_OUTPUT"
-          echo "tag=${GITHUB_SHA::12}"       >> "$GITHUB_OUTPUT"
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+            type=raw,value=latest
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -60,110 +40,160 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & Push
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          tags: ${{ steps.meta.outputs.tags }}
 
-  # ─────────────────────────────────────────────────────────────
-  # Stage 2 — SAST + Secrets + Config
-  # ─────────────────────────────────────────────────────────────
   sast_secrets_config:
-    name: Stage 2/4 - SAST + Secrets + Config
+    name: Stage 2 – SAST + Secrets + Config
     runs-on: ubuntu-24.04
     needs: build_and_push
     steps:
       - uses: actions/checkout@v4
 
-      # Bandit (Python SAST)
-      - name: Run Bandit
-        shell: bash
-        run: |
-          python -m pip install --upgrade pip
-          pip install bandit
-          bandit -r . -f sarif -o bandit.sarif || true
+      # Bandit (Python)
+      - name: Install bandit
+        run: pipx install bandit
+      - name: Run bandit
+        run: bandit -r . -f sarif -o bandit.sarif || true
+      - name: Upload Bandit SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: bandit.sarif, category: bandit }
 
-      # Semgrep (универсальный SAST)
-      - name: Run Semgrep
-        shell: bash
-        run: |
-          pip install semgrep
-          semgrep --config auto --sarif -o semgrep.sarif || true
+      # Semgrep
+      - name: Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with: { config: p/ci, generateSarif: true }
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: semgrep.sarif, category: semgrep }
+        if: always()
 
-      # Gitleaks (Secrets)
-      - name: Run Gitleaks
+      # Gitleaks (secrets)
+      - name: Gitleaks
         uses: gitleaks/gitleaks-action@v2
         with:
-          args: detect --source . --no-git --report-format sarif --report-path gitleaks.sarif
+          args: detect --no-git --report-format sarif --report-path gitleaks.sarif --exit-code 1
+      - name: Upload Gitleaks SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: gitleaks.sarif, category: gitleaks }
+        if: always()
 
-      # Hadolint (Dockerfile)
-      - name: Run Hadolint
+      # Hadolint
+      - name: Hadolint
         uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: ./Dockerfile
+        with: { dockerfile: ./Dockerfile, failure-threshold: error }
 
-      # Trivy (скан образа)
-      - name: Run Trivy
+      # Trivy (image)
+      - name: Trivy image scan
         uses: aquasecurity/trivy-action@0.24.0
         with:
-          image-ref: ${{ needs.build_and_push.outputs.image }}:${{ needs.build_and_push.outputs.tag }}
+          image-ref: ${{ needs.build_and_push.outputs.image }}
           format: sarif
-          output: trivy-image.sarif
+          output: trivy.sarif
           vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
-          exit-code: 0
+          severity: 'CRITICAL,HIGH'
+          exit-code: 1
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: trivy.sarif, category: trivy }
+        if: always()
 
-  # ─────────────────────────────────────────────────────────────
-  # Stage 3 — DAST (плейсхолдер)
-  # ─────────────────────────────────────────────────────────────
-  dast:
-    name: Stage 3 - DAST (placeholder)
+  run_target_locally:
+    name: Stage 3 – Run target locally (for DAST)
     runs-on: ubuntu-24.04
     needs: build_and_push
+    outputs:
+      image: ${{ needs.build_and_push.outputs.image }}
     steps:
-      - uses: actions/checkout@v4
-      - name: DAST stage placeholder
-        run: echo "DAST is skipped here (OWASP ZAP vs ephemeral Dojo was too heavy for GitHub runners)."
+      - name: Pull image
+        run: docker pull ${{ needs.build_and_push.outputs.image }}
 
-  # ─────────────────────────────────────────────────────────────
-  # Stage 5 — Security Gate
-  # ─────────────────────────────────────────────────────────────
-  security_gate:
-    name: Stage 5 - Security Gate
-    runs-on: ubuntu-24.04
-    needs: [build_and_push, sast_secrets_config, dast]
-    if: always()
-    steps:
-      - uses: actions/checkout@v4
+      - name: Run container on 8080
+        run: |
+          docker run -d --rm --name target \
+            -p 8080:8080 \
+            ${{ needs.build_and_push.outputs.image }}
 
-      - name: Gate summary
-        id: gate
+      - name: Wait for health (max 2 min)
         shell: bash
         run: |
-          shopt -s nullglob
-          files=( *.sarif )
-          echo "Found SARIF files: ${#files[@]}"
-          total=0
-          crit=0
-          high=0
-          for f in "${files[@]}"; do
-            echo "::group::Parse $f"
-            c_total=$(grep -ci '"ruleId"' "$f" || true)
-            c_crit=$(grep -ci '"severity": "CRITICAL"' "$f" || true)
-            c_high=$(grep -ci '"severity": "HIGH"' "$f" || true)
-            echo "total=$c_total crit=$c_crit high=$c_high in $f"
-            total=$((total + c_total))
-            crit=$((crit + c_crit))
-            high=$((high + c_high))
-            echo "::endgroup::"
+          for i in {1..120}; do
+            if curl -fsS http://localhost:8080/ >/dev/null 2>&1; then
+              echo "Service is up"; exit 0
+            fi
+            sleep 1
           done
-          echo "TOTAL findings: $total; CRITICAL: $crit; HIGH: $high"
-          echo "crit=$crit" >> "$GITHUB_OUTPUT"
-
-      - name: Block on CRITICAL (optional)
-        if: ${{ env.FAIL_ON_CRITICAL == 'true' && steps.gate.outputs.crit != '0' }}
-        run: |
-          echo "Blocking release: critical vulnerabilities found (${{ steps.gate.outputs.crit }})"
+          echo "Service did not start in time"; docker logs target || true
           exit 1
+
+      - name: Keep container running for next job
+        run: echo "ok"
+
+  dast:
+    name: Stage 4 – DAST (ZAP baseline on localhost)
+    runs-on: ubuntu-24.04
+    needs: [run_target_locally]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ZAP Baseline
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: http://localhost:8080
+          cmd_options: -a -m 5 -I -J zap.json -w zap.md -r zap.html -x zap.xml
+        continue-on-error: true
+
+      - name: Upload ZAP artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-baseline
+          path: |
+            zap.json
+            zap.xml
+            zap.html
+            zap.md
+        if: always()
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f target || true
+
+  security_gate:
+    name: Stage 5 – Security Gate
+    runs-on: ubuntu-24.04
+    needs: [sast_secrets_config, dast]
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: zap-baseline, path: . }
+        if: always()
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Gate summary + block on thresholds
+        shell: bash
+        run: |
+          set -euo pipefail
+          TRIVY_CRIT=0
+          [[ -f trivy.sarif ]] && TRIVY_CRIT=$(jq '[.runs[].results[] | select(.properties.severity=="CRITICAL")] | length' trivy.sarif || echo 0)
+
+          ZAP_HIGH=0
+          [[ -f zap.json ]] && ZAP_HIGH=$(jq '[.site[].alerts[] | select((.risk|ascii_downcase)=="high")] | length' zap.json || echo 0)
+
+          echo "### Security Gate" >> $GITHUB_STEP_SUMMARY
+          echo "- Trivy critical: **$TRIVY_CRIT**" >> $GITHUB_STEP_SUMMARY
+          echo "- ZAP high: **$ZAP_HIGH**" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${FAIL_ON_CRITICAL}" == "true" ]] && { [[ "$TRIVY_CRIT" -gt 0 ]] || [[ "$ZAP_HIGH" -gt 0 ]]; }; then
+            echo "Blocking release due to critical/high findings"
+            exit 1
+          fi
+          echo "Gate passed."
