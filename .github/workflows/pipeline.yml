@@ -67,14 +67,22 @@ jobs:
         with: { sarif_file: bandit.sarif, category: bandit }
 
       # Semgrep
+            # Semgrep
       - name: Semgrep
         uses: returntocorp/semgrep-action@v1
-        with: { config: p/ci, generateSarif: true }
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+        with:
+          config: p/ci
+          generateSarif: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Upload Semgrep SARIF
         uses: github/codeql-action/upload-sarif@v3
-        with: { sarif_file: semgrep.sarif, category: semgrep }
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
         if: always()
+
 
       # Gitleaks (secrets)
       - name: Gitleaks
