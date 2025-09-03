@@ -12,11 +12,7 @@ permissions:
   security-events: write
 
 env:
-  FAIL_ON_CRITICAL: "true"  
-  MAX_HIGH: "0"              
-  MAX_MEDIUM: "5"            
-  MAX_LOW: "99999"           
-  TARGET_PORT: "8080" 
+  FAIL_ON_CRITICAL: "true"   # флаг для Gate (оставил, если захочешь мягкий режим)
 
 jobs:
   # =========================
@@ -31,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-     
+      # Вычисляем имя образа и короткий тег
       - name: Compute image meta (lowercase)
         id: meta
         shell: bash
@@ -51,7 +47,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build
+      - name: Build image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -59,7 +55,7 @@ jobs:
           push: false
           tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
 
-      - name: Push
+      - name: Push image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -68,7 +64,6 @@ jobs:
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
             ${{ steps.meta.outputs.image }}:latest
-
 
   # ==========================================
   # Stage 2 — SAST + Secrets + Config (SARIF)
@@ -104,7 +99,6 @@ jobs:
       - name: Normalize Semgrep SARIF filename
         shell: bash
         run: |
-          # semgrep-action может положить results.sarif
           if [ -f results.sarif ] && [ ! -f semgrep.sarif ]; then
             mv results.sarif semgrep.sarif
           fi
@@ -124,7 +118,7 @@ jobs:
         continue-on-error: true
 
       # --- Trivy image scan -> trivy.sarif ---
-      - name: Trivy image scan
+      - name: Trivy image scan (SARIF)
         uses: aquasecurity/trivy-action@0.24.0
         with:
           image-ref: ${{ needs.build_and_push.outputs.image }}:${{ needs.build_and_push.outputs.tag }}
@@ -139,8 +133,6 @@ jobs:
       - name: Debug SARIF files
         shell: bash
         run: |
-          echo "=== LS in workspace ==="
-          ls -la
           echo "=== Found SARIF ==="
           ls -la *.sarif || echo "No SARIF files found"
 
@@ -173,17 +165,76 @@ jobs:
           sarif_file: trivy.sarif
           category: trivy
 
+  # ==========================================
+  # Stage 3 — DAST (OWASP ZAP baseline)
+  # ==========================================
+  dast:
+    name: Stage 3 – DAST (ZAP baseline)
+    runs-on: ubuntu-24.04
+    needs: build_and_push
+    steps:
+      - uses: actions/checkout@v4
 
-  # ===================================================
-  # Stage 3 — DAST 
-  # ===================================================
-      - name: Run ZAP Baseline
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Поднимаем наш образ локально (ожидается, что приложение слушает 8080)
+      - name: Run target container
+        id: run_target
+        shell: bash
+        env:
+          IMG: ${{ needs.build_and_push.outputs.image }}:${{ needs.build_and_push.outputs.tag }}
+        run: |
+          set -eu
+          docker run -d --rm --name target -p 8080:8080 "$IMG"
+          # ждём старта (до ~60с)
+          for i in $(seq 1 60); do
+            if curl -fsS -m 2 http://localhost:8080/ >/dev/null 2>&1; then
+              echo "App is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "App did not become ready on :8080"
+          docker logs target || true
+          exit 1
+
+      # ZAP baseline scan; сохраняем отчёты и НЕ фейлим стадию (Gate решит)
+      - name: ZAP Baseline Scan
         uses: zaproxy/action-baseline@v0.9.0
         with:
           target: "http://localhost:8080"
-          rules_file_name: .zap/rules.tsv
-          cmd_options: "-a"
+          cmd_options: "-a -J"     # -a активные пасс. проверки, -J -> JSON отчёт
+          fail_action: false
+        continue-on-error: true
 
+      - name: Collect ZAP artifacts
+        if: always()
+        shell: bash
+        run: |
+          # action кладёт артефакты в workspace: report_html.html, report_json.json, etc.
+          ls -la
+          mkdir -p zap
+          # переносим самое полезное, если есть
+          [ -f report_json.json ]  && mv report_json.json  zap/zap_report.json
+          [ -f report_html.html ]  && mv report_html.html  zap/zap_report.html
+          [ -f zap.out ] && cp zap.out zap/zap_console.log || true
+          ls -la zap || true
+
+      - name: Upload ZAP artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-reports
+          path: zap/
+
+      - name: Stop target container
+        if: always()
+        run: docker rm -f target || true
 
   # =========================
   # Stage 5 — Security Gate
@@ -194,68 +245,56 @@ jobs:
     needs: [build_and_push, sast_secrets_config, dast]
     if: always()
     steps:
-      - name: Gate – parse SARIF and enforce thresholds
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Download ZAP artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: zap-reports
+          path: zap/
+
+      - name: Login to GHCR (for additional strict Trivy gate)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Жёсткий порог: Trivy — CRITICAL => fail
+      - name: Trivy Gate (fail on CRITICAL)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ needs.build_and_push.outputs.image }}:${{ needs.build_and_push.outputs.tag }}
+          severity: 'CRITICAL'
+          ignore-unfixed: false
+          format: table
+          exit-code: '1'
+
+      # Жёсткий порог: ZAP — High alerts => fail
+      - name: ZAP Gate (fail on High risk findings)
         shell: bash
         run: |
-          set -euo pipefail
-          echo "== Gate: parse *.sarif =="
-          ls -1 *.sarif 2>/dev/null || { echo "No SARIF files. Nothing to gate."; exit 0; }
-
-          # jq уже есть на ubuntu-24.04 runner
-          crit=0; high=0; med=0; low=0
-
-          parse_file() {
-            local f="$1"
-            echo "Parsing $f"
-            # Вытащим нормализованные «severity/level» из разных SARIF-вариантов
-            jq -r '
-              def sev:
-                ( .level //                       # общий уровень результата
-                  .rule?.properties?."security-severity" //
-                  .properties?."security-severity" //
-                  .severity //                    # встречается у некоторых
-                  .rule?.defaultConfiguration?.level //
-                  "warning"
-                ) | ascii_downcase;
-
-              .runs[].results[]? | sev
-            ' "$f"
-          }
-
-          for f in *.sarif; do
-            while read -r s; do
-              case "$s" in
-                critical|blocker) crit=$((crit+1));;
-                high|error)       high=$((high+1));;
-                medium|moderate)  med=$((med+1));;
-                low|warning|note) low=$((low+1));;
-                *)                low=$((low+1));;
-              esac
-            done < <(parse_file "$f")
-          done
-
-          echo "== Totals =="
-          echo "CRITICAL: $crit"
-          echo "HIGH    : $high"
-          echo "MEDIUM  : $med"
-          echo "LOW     : $low"
-
-          fail=false
-          if [[ "${FAIL_ON_CRITICAL,,}" == "true" && $crit -gt 0 ]]; then
-            echo "❌ Gate: CRITICAL found -> fail"; fail=true
+          set -e
+          if [ ! -f zap/zap_report.json ]; then
+            echo "::warning::ZAP JSON report not found; skipping ZAP gate."
+            exit 0
           fi
-          if (( high > ${MAX_HIGH:-0} )); then
-            echo "❌ Gate: HIGH ($high) > MAX_HIGH (${MAX_HIGH:-0})"; fail=true
-          fi
-          if (( med > ${MAX_MEDIUM:-0} )); then
-            echo "❌ Gate: MEDIUM ($med) > MAX_MEDIUM (${MAX_MEDIUM:-0})"; fail=true
-          fi
-          if (( low > ${MAX_LOW:-999999} )); then
-            echo "❌ Gate: LOW ($low) > MAX_LOW (${MAX_LOW:-999999})"; fail=true
-          fi
-
-          if [[ "$fail" == "true" ]]; then
+          # Посчитаем High из JSON (riskcode: 3)
+          HIGHS=$(jq '[.. | objects | select(has("riskcode")) | select(.riskcode|tonumber>=3)] | length' zap/zap_report.json)
+          echo "ZAP High-or-higher alerts: $HIGHS"
+          if [ "$HIGHS" -gt 0 ]; then
+            echo "❌ ZAP Gate: High alerts found ($HIGHS). Failing."
             exit 1
           else
-            echo "✅ Gate: thresholds satisfied"
+            echo "✅ ZAP Gate: no High alerts."
           fi
+
+      - name: Final summary
+        if: always()
+        shell: bash
+        run: |
+          echo "Security Gate finished."
+          echo "Trivy CRITICAL and ZAP High thresholds are enforced."
