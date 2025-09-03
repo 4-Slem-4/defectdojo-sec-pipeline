@@ -54,6 +54,7 @@ jobs:
             p/python
             p/django
             p/owasp-top-ten
+          # Параметры у экшена иногда меняются; даже если warning — отчёт всё равно будет
           generateSarif: true
           auditOn: push
       - name: Save Semgrep JSON
@@ -96,6 +97,7 @@ jobs:
         with:
           name: gitleaks
           path: gitleaks.json
+        continue-on-error: true
 
   trivy:
     name: Image & Config scan - Trivy
@@ -158,7 +160,7 @@ jobs:
             mariadb:10.11
           docker run -d --rm --name redis --network dojo-net redis:7-alpine
 
-      - name: Start DefectDojo
+      - name: Start DefectDojo (your image)
         run: |
           LATEST_TAG="${{ env.IMAGE_BASE }}:latest"
           docker run -d --rm --name dojo --network dojo-net -p 8080:8080 \
@@ -177,15 +179,40 @@ jobs:
             -e DD_ADMIN_MAIL=admin@example.com \
             "$LATEST_TAG"
 
-      - name: Wait for Dojo
+      - name: Wait for Dojo (up to ~10 minutes)
+        id: wait_dojo
         run: |
-          for i in {1..60}; do
-            if curl -fsS http://localhost:8080 >/dev/null; then echo "Dojo is up"; exit 0; fi
+          ATTEMPTS=120     # 120 * 5s = 10 минут
+          for i in $(seq 1 $ATTEMPTS); do
+            if curl -fsS http://localhost:8080 >/dev/null; then
+              echo "Dojo is up"
+              exit 0
+            fi
+            echo "[$i/$ATTEMPTS] waiting for Dojo..."
+            # Периодически печатаем последние логи
+            docker logs --tail 20 dojo || true
             sleep 5
           done
-          echo "Dojo did not start in time"; docker logs dojo || true; exit 1
+          echo "Dojo did not start in time"
+          docker logs dojo || true
+          echo "status=timeout" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Save Dojo logs (artifact)
+        if: failure() || steps.wait_dojo.outputs.status == 'timeout'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dojo-logs
+          path: |
+            dojo.log
+        continue-on-error: true
+        # сохраним логи в файл
+      - name: Dump Dojo logs to file
+        if: always()
+        run: docker logs dojo > dojo.log 2>&1 || true
 
       - name: ZAP Baseline
+        if: success()    # только если Dojo поднялся
         continue-on-error: true
         run: |
           docker run --rm --network dojo-net -v $PWD:/zap/wrk \
@@ -193,6 +220,7 @@ jobs:
             -t http://dojo:8080 -r zap-baseline.html -J zap-baseline.json -m 5 -d
 
       - name: ZAP Full Scan
+        if: success()
         continue-on-error: true
         run: |
           docker run --rm --network dojo-net -v $PWD:/zap/wrk \
@@ -200,6 +228,7 @@ jobs:
             -t http://dojo:8080 -r zap-full.html -J zap-full.json -m 5 -I
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: zap
           path: |
@@ -239,11 +268,16 @@ jobs:
         with:
           name: zap
           path: art/zap
+      - uses: actions/download-artifact@v4
+        if: always()
+        with:
+          name: dojo-logs
+          path: art/dojo-logs
 
       - name: Decide
         run: |
           python - << 'PY'
-          import json,sys
+          import json,sys,os
           def J(p):
             try: return json.load(open(p,encoding='utf-8'))
             except: return None
@@ -292,6 +326,7 @@ jobs:
           gtl=has_gitleaks(J("art/gitleaks/gitleaks.json"))
           tot={k:sem.get(k,0)+ban.get(k,0)+tri.get(k,0)+zap.get(k,0) for k in ["LOW","MEDIUM","HIGH","CRITICAL"]}
           print("SUMMARY:", {"semgrep":sem,"bandit":ban,"trivy":tri,"zap":zap,"gitleaks":gtl,"total":tot})
+          # гейт: секреты = стоп; CRITICAL > 0 = стоп; HIGH >=5 = стоп
           if gtl: print("FAIL: secrets found"); sys.exit(1)
           if tot["CRITICAL"]>0: print("FAIL: critical issues"); sys.exit(1)
           if tot["HIGH"]>=5: print("FAIL: too many HIGH"); sys.exit(1)
