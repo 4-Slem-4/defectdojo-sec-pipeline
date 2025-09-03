@@ -206,8 +206,8 @@ jobs:
       - name: ZAP Baseline Scan
         uses: zaproxy/action-baseline@v0.9.0
         with:
-          target: "http://localhost:8081"   
-          cmd_options: "-a -J"
+          target: "http://localhost:8081"
+          cmd_options: "-a -m 3 -T 120"   # <- без -J !
           fail_action: false
         continue-on-error: true
 
