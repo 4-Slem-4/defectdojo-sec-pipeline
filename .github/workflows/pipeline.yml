@@ -24,13 +24,14 @@ jobs:
       - name: Ensure Dockerfile (fallback)
         run: |
           if [ ! -f Dockerfile ]; then
-            cat > Dockerfile <<'EOF'
-            FROM nginx:alpine
-            RUN echo OK > /usr/share/nginx/html/healthz
-            EXPOSE 80
-            CMD ["nginx","-g","daemon off;"]
-            EOF
+              cat > Dockerfile <<'EOF'
+              FROM nginx:alpine
+              RUN echo OK > /usr/share/nginx/html/healthz
+              EXPOSE 80
+              CMD ["nginx","-g","daemon off;"]
+              EOF
           fi
+
 
       - name: Compute image name (lowercase)
         id: meta
