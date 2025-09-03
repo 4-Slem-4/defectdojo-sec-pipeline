@@ -22,10 +22,11 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
-      - uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -38,9 +39,8 @@ jobs:
         id: tags
         run: |
           REPO_LC=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
-          echo "REPO_LC=${REPO_LC}" >> $GITHUB_OUTPUT
-          echo "IMG=${REPO_LC}" >> $GITHUB_OUTPUT
-          echo "TAG_SHA=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+          echo "IMG=${REPO_LC}" >> "$GITHUB_OUTPUT"
+          echo "TAG_SHA=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Build image
         run: |
@@ -57,8 +57,10 @@ jobs:
     name: SAST - Semgrep
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: returntocorp/semgrep-action@v1
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
         with:
           config: p/ci
           generateSarif: true
@@ -68,8 +70,10 @@ jobs:
     name: SAST - Bandit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.x"
       - name: Install bandit
@@ -86,12 +90,13 @@ jobs:
     name: Secrets scan - Gitleaks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Run gitleaks (docker)
         run: |
-          docker run --rm -v $PWD:/repo zricethezav/gitleaks:8 \
+          docker run --rm -v "$PWD":/repo zricethezav/gitleaks:8 \
             detect --source=/repo --redact --no-git \
             --report-format=json --report-path=/repo/gitleaks.json || true
       - name: Upload gitleaks report
@@ -106,7 +111,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: aquasecurity/trivy-action@0.24.0
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@0.24.0
         with:
           image-ref: ghcr.io/${{ github.repository }}:${{ env.IMAGE_LATEST }}
           format: sarif
@@ -122,12 +128,14 @@ jobs:
     name: Dockerfile Lint - Hadolint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: hadolint/hadolint-action@v3.1.0
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
           ignore: DL3007,DL3008
-      - name: Note about latest tag (warning only)
+      - name: Note about latest tag
         run: echo "Using 'latest' may be unstable; pin versions." || true
 
   dast_zap:
@@ -135,7 +143,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - name: Checkout this repo (we’ll keep artifacts here)
+      - name: Checkout (for artifacts)
         uses: actions/checkout@v4
 
       - name: Install docker compose plugin
@@ -168,7 +176,7 @@ jobs:
           DD_ADMIN_MAIL=admin@example.com
           EOF
 
-      - name: Launch Dojo stack (db+redis+django+nginx)
+      - name: Launch Dojo stack
         working-directory: dojo
         run: |
           docker compose -f docker-compose.yml --env-file .env.dast up -d db redis django nginx
@@ -177,9 +185,9 @@ jobs:
       - name: Wait for Dojo (up to 10 minutes)
         shell: bash
         run: |
-          ATTEMPTS=120   # 120 * 5s = 10 min
+          ATTEMPTS=120
           for i in $(seq 1 $ATTEMPTS); do
-            if curl -fsS http://localhost:8080/ > /dev/null; then
+            if curl -fsS http://localhost:8080/ >/dev/null; then
               echo "Dojo is up"; exit 0
             fi
             sleep 5
@@ -192,9 +200,10 @@ jobs:
         continue-on-error: true
         run: |
           docker run --rm --network host \
-            -v $PWD:/zap/wrk \
+            -v "$PWD":/zap/wrk \
             owasp/zap2docker-stable \
             zap-baseline.py -t http://localhost:8080/ -r zap-baseline.html -x zap-baseline.xml || true
+
       - name: Upload ZAP reports
         uses: actions/upload-artifact@v4
         with:
@@ -208,7 +217,7 @@ jobs:
         if: always()
         run: |
           docker compose -f dojo/docker-compose.yml --env-file dojo/.env.dast logs --no-color > dojo-logs.txt || true
-        continue-on-error: true
+
       - name: Upload Dojo logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -228,22 +237,21 @@ jobs:
     needs: [build, sast_semgrep, sast_bandit, secrets_gitleaks, trivy, hadolint, dast_zap]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download ZAP artifacts
+        uses: actions/download-artifact@v4
         with:
           name: zap-reports
           path: gate_artifacts
         continue-on-error: true
-      - uses: actions/download-artifact@v4
-        with:
-          name: codeql-sarif
-          path: gate_artifacts
-        continue-on-error: true
-      - uses: actions/download-artifact@v4
+
+      - name: Download gitleaks report
+        uses: actions/download-artifact@v4
         with:
           name: gitleaks.json
           path: gate_artifacts
         continue-on-error: true
-      - name: Download trivy SARIF
+
+      - name: Download Trivy SARIF
         uses: actions/download-artifact@v4
         with:
           name: trivy.sarif
