@@ -9,13 +9,14 @@ on:
 
 permissions:
   contents: read
-  packages: write
+  packages: write          # нужно для push в GHCR
   security-events: write
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/defectdojo-sec-pipeline:${{ github.sha }}
-  LATEST_TAG: ghcr.io/${{ github.repository_owner }}/defectdojo-sec-pipeline:latest
+  IMAGE_BASE: ghcr.io/${{ toLower(github.repository) }}   # owner/repo в нижнем регистре
+  IMAGE_NAME: ${{ env.IMAGE_BASE }}:${{ github.sha }}
+  LATEST_TAG: ${{ env.IMAGE_BASE }}:latest
 
 jobs:
   build:
@@ -23,11 +24,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: docker/setup-buildx-action@v3
+
       - name: Login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
       - name: Build image
         run: docker build -t "$IMAGE_NAME" -t "$LATEST_TAG" .
+
       - name: Push image
         run: |
           docker push "$IMAGE_NAME"
@@ -95,16 +100,21 @@ jobs:
     needs: [build]
     steps:
       - uses: actions/checkout@v4
+
       - name: Login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
       - name: Install Trivy
         uses: aquasecurity/setup-trivy@v0.2.2
+
       - name: Trivy image scan
         continue-on-error: true
         run: trivy image --scanners vuln,secret --ignore-unfixed --format json -o trivy-image.json "$LATEST_TAG"
+
       - name: Trivy config scan (repo)
         continue-on-error: true
         run: trivy config --format json -o trivy-config.json .
+
       - uses: actions/upload-artifact@v4
         with:
           name: trivy
@@ -129,8 +139,10 @@ jobs:
     needs: [build]
     steps:
       - uses: actions/checkout@v4
+
       - name: Create network
         run: docker network create dojo-net
+
       - name: Start DB & Redis
         run: |
           docker run -d --rm --name db --network dojo-net \
@@ -140,6 +152,7 @@ jobs:
             -e MARIADB_PASSWORD=dojopwd \
             mariadb:10.11
           docker run -d --rm --name redis --network dojo-net redis:7-alpine
+
       - name: Start DefectDojo
         run: |
           docker run -d --rm --name dojo --network dojo-net -p 8080:8080 \
@@ -157,6 +170,7 @@ jobs:
             -e DD_ADMIN_PASSWORD=Admin123! \
             -e DD_ADMIN_MAIL=admin@example.com \
             ${{ env.LATEST_TAG }}
+
       - name: Wait for Dojo
         run: |
           for i in {1..60}; do
@@ -164,18 +178,21 @@ jobs:
             sleep 5
           done
           echo "Dojo did not start in time"; docker logs dojo || true; exit 1
+
       - name: ZAP Baseline
         continue-on-error: true
         run: |
           docker run --rm --network dojo-net -v $PWD:/zap/wrk \
             owasp/zap2docker-stable zap-baseline.py \
             -t http://dojo:8080 -r zap-baseline.html -J zap-baseline.json -m 5 -d
+
       - name: ZAP Full Scan
         continue-on-error: true
         run: |
           docker run --rm --network dojo-net -v $PWD:/zap/wrk \
             owasp/zap2docker-stable zap-full-scan.py \
             -t http://dojo:8080 -r zap-full.html -J zap-full.json -m 5 -I
+
       - uses: actions/upload-artifact@v4
         with:
           name: zap
@@ -184,6 +201,7 @@ jobs:
             zap-baseline.json
             zap-full.html
             zap-full.json
+
       - name: Cleanup
         if: always()
         run: |
@@ -215,6 +233,7 @@ jobs:
         with:
           name: zap
           path: art/zap
+
       - name: Decide
         run: |
           python - << 'PY'
