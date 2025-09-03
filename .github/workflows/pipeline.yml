@@ -96,8 +96,9 @@ jobs:
           if [ -f semgrep.sarif ]; then
             :
           elif [ -f results.sarif ]; then
-             mv results.sarif semgrep.sarif
+            mv results.sarif semgrep.sarif
           fi
+
 
         # Gitleaks (секреты)
       - name: Run gitleaks
@@ -125,9 +126,18 @@ jobs:
             exit-code: 0
         continue-on-error: true
 
-        # Небольшая проверка чтобы сразу видеть, что файлы появились
-      - name: List SARIF files (debug)
-        run: ls -la *.sarif || true
+      - name: Debug SARIF files
+        run: |
+          echo "=== SARIF files ==="
+          ls -la *.sarif || echo "No sarif files found"
+
+      - name: Upload Bandit SARIF
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit.sarif
+          category: bandit
 
         # Uploads
       - name: Upload Bandit SARIF
