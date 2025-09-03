@@ -68,6 +68,9 @@ jobs:
   # ==========================================
   # Stage 2 — SAST + Secrets + Config (SARIF)
   # ==========================================
+    # ==========================================
+  # Stage 2 — SAST + Secrets + Config (SARIF)
+  # ==========================================
   sast_secrets_config:
     name: Stage 2/4 – SAST + Secrets + Config
     runs-on: ubuntu-24.04
@@ -75,98 +78,98 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Bandit (Python)
-      - name: Install Bandit
-        run: |
-            python3 -m pip install --upgrade pip
-            pip install bandit
-      - name: Run bandit
-        run: |
-            bandit -r . -f sarif -o bandit.sarif || true
+      # --- Bandit (Python) -> bandit.sarif ---
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
 
-        # Semgrep
-      - name: Run semgrep
+      - name: Bandit (SARIF)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit
+          bandit -r . -f sarif -o bandit.sarif || true
+
+      # --- Semgrep -> semgrep.sarif ---
+      - name: Semgrep (SARIF)
         uses: returntocorp/semgrep-action@v1
         with:
-            config: p/ci
-            generateSarif: true
+          config: p/ci
+          generateSarif: true
         continue-on-error: true
-      - name: Normalize semgrep sarif name
+
+      - name: Normalize Semgrep SARIF filename
+        shell: bash
         run: |
-          if [ -f semgrep.sarif ]; then
-            :
-          elif [ -f results.sarif ]; then
+          # semgrep-action может положить results.sarif
+          if [ -f results.sarif ] && [ ! -f semgrep.sarif ]; then
             mv results.sarif semgrep.sarif
           fi
 
-
-        # Gitleaks (секреты)
-      - name: Run gitleaks
+      # --- Gitleaks (secrets) -> gitleaks.sarif ---
+      - name: Gitleaks (SARIF)
         uses: gitleaks/gitleaks-action@v2
         with:
-            args: detect --source . --no-git --report-format sarif --report-path gitleaks.sarif --exit-code 0
+          args: detect --source . --no-git --report-format sarif --report-path gitleaks.sarif --exit-code 0
         continue-on-error: true
 
-        # Hadolint (линт Dockerfile) 
+      # --- Hadolint (Dockerfile lint) ---
       - name: Hadolint
         uses: hadolint/hadolint-action@v3.1.0
         with:
-            dockerfile: ./Dockerfile
+          dockerfile: ./Dockerfile
         continue-on-error: true
 
-        # Trivy
+      # --- Trivy image scan -> trivy.sarif ---
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@0.24.0
         with:
-            image-ref: ${{ needs.build_and_push.outputs.image }}:${{ needs.build_and_push.outputs.tag }}
-            format: sarif
-            output: trivy.sarif
-            vuln-type: 'os,library'
-            severity: 'CRITICAL,HIGH,MEDIUM,LOW'
-            exit-code: 0
+          image-ref: ${{ needs.build_and_push.outputs.image }}:${{ needs.build_and_push.outputs.tag }}
+          format: sarif
+          output: trivy.sarif
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+          exit-code: 0
         continue-on-error: true
 
+      # --- Debug: показать, какие *.sarif реально есть ---
       - name: Debug SARIF files
+        shell: bash
         run: |
-          echo "=== SARIF files ==="
-          ls -la *.sarif || echo "No sarif files found"
+          echo "=== LS in workspace ==="
+          ls -la
+          echo "=== Found SARIF ==="
+          ls -la *.sarif || echo "No SARIF files found"
 
+      # --- Upload SARIF (только если файл есть) ---
       - name: Upload Bandit SARIF
-        if: always()
-        continue-on-error: true
+        if: always() && hashFiles('bandit.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: bandit.sarif
           category: bandit
 
-        # Uploads
-      - name: Upload Bandit SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-            sarif_file: bandit.sarif
-            category: bandit
-
       - name: Upload Semgrep SARIF
-        if: always()
+        if: always() && hashFiles('semgrep.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
-            sarif_file: semgrep.sarif
-            category: semgrep
+          sarif_file: semgrep.sarif
+          category: semgrep
 
       - name: Upload Gitleaks SARIF
-        if: always()
+        if: always() && hashFiles('gitleaks.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
-            sarif_file: gitleaks.sarif
-            category: gitleaks
+          sarif_file: gitleaks.sarif
+          category: gitleaks
 
       - name: Upload Trivy SARIF
-        if: always()
+        if: always() && hashFiles('trivy.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
-            sarif_file: trivy.sarif
-            category: trivy
+          sarif_file: trivy.sarif
+          category: trivy
 
 
   # ===================================================
